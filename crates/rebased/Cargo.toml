@@ -1,0 +1,15 @@
+[package]
+name = "rebased"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.99"
+chrono = "0.4.42"
+clap = { version = "4.5.47", features = ["derive"] }
+crossterm = "0.29.0"
+git2 = "0.20.2"
+ratatui = { version = "0.29.0", features = ["unstable-widget-ref"] }
+thiserror = "2.0.16"
+unicode-width = "0.2.0"
+ratatui-tree = { path = "../ratatui_tree" }
