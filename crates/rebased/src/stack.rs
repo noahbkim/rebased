@@ -1,11 +1,11 @@
-use std::collections::VecDeque;
-use std::ops::{Index, SubAssign};
-use std::path::Path;
-
-use git2::{Commit, Oid};
+use git2::{Commit, Delta, Deltas, Diff, DiffDelta, DiffFlags, FileMode, Oid};
 use git2::{DiffFile, Repository};
+use std::collections::VecDeque;
+use std::ops::{Deref, Index, SubAssign};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use anyhow::Context as _;
+use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -15,52 +15,81 @@ use ratatui::widgets::{Block, BorderType, Paragraph, StatefulWidgetRef};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_tree::{tree_index, Tree, TreeIndex, TreeItem, TreeState, TreeView};
 
-// MARK: Stack
+// MARK: Extra
 
-#[derive(Debug)]
-pub struct StackCommitFile<'repo> {
-    pub(crate) inner: DiffFile<'repo>,
+struct StackCommitDeltaFile {
+    mode: FileMode,
+    path: Option<PathBuf>,
 }
 
-impl<'a, 'repo> Into<TreeItem<'a>> for &'a StackCommitFile<'repo> {
+impl<'a> From<DiffFile<'a>> for StackCommitDeltaFile {
+    fn from(file: DiffFile<'a>) -> Self {
+        Self {
+            mode: file.mode(),
+            path: file.path().map(PathBuf::from),
+        }
+    }
+}
+
+// MARK: Delta
+
+struct DeltaNode {
+    status: Delta,
+    new_file: StackCommitDeltaFile,
+    old_file: StackCommitDeltaFile,
+    flags: DiffFlags,
+}
+
+impl From<DiffDelta<'_>> for DeltaNode {
+    fn from(delta: DiffDelta<'_>) -> Self {
+        Self {
+            status: delta.status(),
+            new_file: delta.new_file().into(),
+            old_file: delta.old_file().into(),
+            flags: delta.flags(),
+        }
+    }
+}
+
+impl<'a> Into<TreeItem<'a>> for &'a DeltaNode {
     fn into(self) -> TreeItem<'a> {
-        let path = self.inner.path().and_then(Path::to_str).unwrap_or("?");
+        let path = self
+            .new_file
+            .path
+            .as_deref()
+            .and_then(Path::to_str)
+            .unwrap_or("?");
         TreeItem::new_empty(Line::from(path))
     }
 }
 
-#[derive(Debug)]
-pub struct StackCommit<'repo> {
-    pub(crate) inner: Commit<'repo>,
-    pub(crate) files: Vec<StackCommitFile<'repo>>,
-    pub(crate) is_collapsed: bool,
+// MARK: Commit
+
+struct CommitNode<'repo> {
+    commit: Commit<'repo>,
+    diff: Option<Diff<'repo>>,
+    deltas: Vec<Node<'repo>>,
+    is_collapsed: bool,
 }
 
-impl<'repo> StackCommit<'repo> {
-    pub fn new(inner: Commit<'repo>) -> Self {
+impl<'repo> From<Commit<'repo>> for CommitNode<'repo> {
+    fn from(commit: Commit<'repo>) -> Self {
         Self {
-            inner,
-            files: Vec::new(),
-            is_collapsed: false,
+            commit,
+            diff: None,
+            deltas: Vec::new(),
+            is_collapsed: true,
         }
     }
-
-    pub fn len(&self) -> usize {
-        self.files.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
-    }
 }
 
-impl<'a, 'repo> Into<TreeItem<'a>> for &'a StackCommit<'repo> {
+impl<'a, 'repo> Into<TreeItem<'a>> for &'a CommitNode<'repo> {
     fn into(self) -> TreeItem<'a> {
         let icon: &'static str = if self.is_collapsed { " + " } else { " - " };
-        let mut hash = self.inner.id().to_string();
+        let mut hash = self.commit.id().to_string();
         hash.truncate(8);
         let message = self
-            .inner
+            .commit
             .message()
             .and_then(|message| message.lines().next())
             .unwrap_or("");
@@ -68,31 +97,114 @@ impl<'a, 'repo> Into<TreeItem<'a>> for &'a StackCommit<'repo> {
         if self.is_collapsed {
             TreeItem::new_empty(label)
         } else {
-            TreeItem::new(label, self.files.iter())
+            TreeItem::new(label, self.deltas.iter())
         }
     }
 }
 
-impl<'repo> Index<usize> for StackCommit<'repo> {
-    type Output = StackCommitFile<'repo>;
+impl<'repo> Index<usize> for CommitNode<'repo> {
+    type Output = DeltaNode;
 
     fn index(&self, index: usize) -> &Self::Output {
-        self.files.index(index)
+        self.deltas.index(index).unwrap_delta_ref()
     }
 }
 
-#[derive(Debug, Default)]
-pub struct Stack<'repo> {
-    pub(crate) commits: Vec<StackCommit<'repo>>,
+// MARK: Node
+
+enum Node<'repo> {
+    Delta(DeltaNode),
+    Commit(CommitNode<'repo>),
 }
 
-impl<'repo> Stack<'repo> {
-    pub fn new() -> Stack<'repo> {
-        Self::default()
+impl<'repo> Node<'repo> {
+    pub fn unwrap_delta_ref(&self) -> &DeltaNode {
+        match self {
+            Node::Delta(delta) => delta,
+            _ => panic!("node contains a commit"),
+        }
     }
 
-    pub fn push(&mut self, commit: Commit<'repo>) {
-        self.commits.push(StackCommit::new(commit));
+    pub fn unwrap_delta_mut(&mut self) -> &mut DeltaNode {
+        match self {
+            Node::Delta(delta) => delta,
+            _ => panic!("node contains a delta"),
+        }
+    }
+
+    pub fn unwrap_commit_ref(&self) -> &CommitNode<'repo> {
+        match self {
+            Node::Commit(commit) => commit,
+            _ => panic!("node contains a delta"),
+        }
+    }
+
+    pub fn unwrap_commit_mut(&mut self) -> &mut CommitNode<'repo> {
+        match self {
+            Node::Commit(commit) => commit,
+            _ => panic!("node contains a delta"),
+        }
+    }
+}
+
+impl<'repo> From<DiffDelta<'_>> for Node<'repo> {
+    fn from(delta: DiffDelta<'_>) -> Self {
+        Node::Delta(delta.into())
+    }
+}
+
+impl<'repo> From<Commit<'repo>> for Node<'repo> {
+    fn from(commit: Commit<'repo>) -> Self {
+        Node::Commit(commit.into())
+    }
+}
+
+impl<'a, 'repo> Into<TreeItem<'a>> for &'a Node<'repo> {
+    fn into(self) -> TreeItem<'a> {
+        match self {
+            Node::Delta(delta) => delta.into(),
+            Node::Commit(commit) => commit.into(),
+        }
+    }
+}
+
+impl<'repo> TreeView<Node<'repo>> for Node<'repo> {
+    type ChildIter<'a>
+        = std::slice::Iter<'a, Node<'repo>>
+    where
+        Self: 'a;
+
+    fn iter_children(&self) -> Self::ChildIter<'_> {
+        match self {
+            Node::Delta(_) => std::slice::Iter::default(),
+            Node::Commit(commit) => commit.deltas.iter(),
+        }
+    }
+}
+
+// MARK: Stack
+
+struct StackTree<'repo> {
+    commits: Vec<Node<'repo>>,
+}
+
+impl<'repo> StackTree<'repo> {
+    pub fn new() -> Self {
+        Self {
+            commits: Vec::new(),
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&CommitNode<'repo>> {
+        self.commits.get(index).map(Node::unwrap_commit_ref)
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut CommitNode<'repo>> {
+        self.commits.get_mut(index).map(Node::unwrap_commit_mut)
+    }
+
+    pub fn push<T: Into<CommitNode<'repo>>>(&mut self, commit: T) {
+        self.commits.push(Node::Commit(commit.into()));
     }
 
     pub fn clear(&mut self) {
@@ -108,11 +220,22 @@ impl<'repo> Stack<'repo> {
     }
 }
 
-impl<'repo> Index<usize> for Stack<'repo> {
-    type Output = StackCommit<'repo>;
+impl<'repo> Index<usize> for StackTree<'repo> {
+    type Output = CommitNode<'repo>;
 
     fn index(&self, index: usize) -> &Self::Output {
-        self.commits.index(index)
+        self.commits.index(index).unwrap_commit_ref()
+    }
+}
+
+impl<'repo> TreeView<Node<'repo>> for StackTree<'repo> {
+    type ChildIter<'a>
+        = std::slice::Iter<'a, Node<'repo>>
+    where
+        Self: 'a;
+
+    fn iter_children(&self) -> Self::ChildIter<'_> {
+        self.commits.iter()
     }
 }
 
@@ -120,7 +243,7 @@ impl<'repo> Index<usize> for Stack<'repo> {
 
 struct Model<'repo> {
     repo: &'repo Repository,
-    stack: Stack<'repo>,
+    stack: StackTree<'repo>,
     tree: TreeState,
 }
 
@@ -128,86 +251,12 @@ impl<'repo> Model<'repo> {
     pub fn new(repo: &'repo Repository) -> Self {
         Self {
             repo,
-            stack: Stack::new(),
+            stack: StackTree::new(),
             tree: TreeState::new(),
         }
     }
 
-    pub fn select_up(&mut self) {
-        if let Some(selected) = self.tree.selected_mut() {
-            match selected.as_mut_slice() {
-                [0] => {}
-                [i] => {
-                    *i -= 1;
-                    self.stack[*i]
-                        .len()
-                        .checked_sub(1)
-                        .map(|i| selected.push(i));
-                }
-                [i, 0] => {
-                    selected.pop();
-                }
-                [i, j] => *j -= 1,
-                _ => {}
-            };
-        };
-    }
-
-    pub fn select_down(&mut self) {
-        if let Some(selected) = self.tree.selected_mut() {
-            match selected.as_mut_slice() {
-                [i] => {
-                    if self.stack[*i].is_empty() {
-                        *i = (*i + 1).min(self.stack.len().saturating_sub(1))
-                    } else {
-                        selected.push(0)
-                    }
-                }
-                [i, j] => {
-                    if j.saturating_add(1) < self.stack[*i].len() {
-                        *j += 1;
-                    } else if i.saturating_add(1) < self.stack.len() {
-                        *i += 1;
-                        selected.pop();
-                    }
-                }
-                _ => {}
-            };
-        };
-    }
-}
-
-// MARK: Messaging
-
-enum Message {
-    Noop,
-    Load(String),
-    Terminal(Event),
-    Exit,
-}
-
-// MARK: Controller
-
-struct Controller<'a, 'repo> {
-    repo: &'repo Repository,
-    model: &'a mut Model<'repo>,
-    queue: VecDeque<Message>,
-}
-
-impl<'a, 'repo> Controller<'a, 'repo> {
-    fn new(repo: &'repo Repository, model: &'a mut Model<'repo>) -> Self {
-        Self {
-            repo,
-            model,
-            queue: VecDeque::new(),
-        }
-    }
-
-    fn message(&mut self, message: Message) {
-        self.queue.push_back(message);
-    }
-
-    fn load(&mut self, base: &str) -> anyhow::Result<()> {
+    fn load_commits_since_merge_base_with(&mut self, base: &str) -> anyhow::Result<()> {
         let base_id = self
             .repo
             .resolve_reference_from_short_name(base)
@@ -225,7 +274,6 @@ impl<'a, 'repo> Controller<'a, 'repo> {
             .merge_base(head_id, base_id)
             .with_context(|| format!("failed to resolve merge base between {} and HEAD", base))?;
 
-        self.model.stack.clear();
         let mut revwalk = self
             .repo
             .revwalk()
@@ -236,6 +284,8 @@ impl<'a, 'repo> Controller<'a, 'repo> {
         revwalk
             .set_sorting(git2::Sort::TOPOLOGICAL)
             .context("failed to sort the revision walk topologically")?;
+
+        self.stack.clear();
         for result in revwalk {
             let id = result.context("failed to retrieve commit from revwalk")?;
             if id == merge_base_id {
@@ -245,45 +295,133 @@ impl<'a, 'repo> Controller<'a, 'repo> {
                 .repo
                 .find_commit(id)
                 .with_context(|| format!("failed to find commit {}", id))?;
-            self.model.stack.push(commit);
+            self.stack.push(commit);
         }
 
-        if self.model.stack.is_empty() {
-            self.model.tree.select(None)
+        self.stack.commits.reverse();
+        if self.stack.is_empty() {
+            self.tree.select(None)
         } else {
-            self.model.tree.select(Some(TreeIndex::new(0)));
+            self.tree.select(Some(TreeIndex::new(0)));
         }
 
         Ok(())
     }
 
-    fn toggle(&mut self) {
-        // let Some(node) = self.commits.get_mut(index) else {
-        //     state.status = format!("invalid commit index {}", index);
-        //     return;
+    pub fn toggle_deltas(&mut self, commit_index: usize) -> anyhow::Result<()> {
+        let Some(commit_node) = self.stack.get_mut(commit_index) else {
+            // state.status = format!("invalid commit index {}", index);
+            // TODO
+            return Ok(());
+        };
+
+        if commit_node.diff.is_none() {
+            if commit_node.commit.parent_count() != 1 {
+                return Err(anyhow::format_err!(
+                    "commit {} has {} parents",
+                    commit_node.commit.id(),
+                    commit_node.commit.parent_count()
+                ));
+            };
+
+            let diff = self.repo.diff_tree_to_tree(
+                Some(
+                    &commit_node
+                        .commit
+                        .parent(0)
+                        .context("failed to retrieve commit parent")?
+                        .tree()
+                        .context("failed to retrieve commit tree")?,
+                ),
+                Some(
+                    &commit_node
+                        .commit
+                        .tree()
+                        .context("failed to retrieve commit tree")?,
+                ),
+                None,
+            )?;
+
+            commit_node.deltas = diff.deltas().map(Node::from).collect();
+            commit_node.diff = Some(diff);
+        }
+
+        commit_node.is_collapsed = !commit_node.is_collapsed;
+        Ok(())
+    }
+
+    pub fn show_delta(&mut self, commit_index: usize, delta_index: usize) -> anyhow::Result<()> {
+        let Some(stack_commit) = self.stack.get_mut(commit_index) else {
+            // state.status = format!("invalid commit index {}", index);
+            // TODO
+            return Ok(());
+        };
+
+        // let Some(stack_commit_delta) = stack_commit.get_mut(delta_index) else {
+        //     // state.status = format!("invalid commit index {}", index);
+        //     // TODO
+        //     return Ok(());
         // };
-        //
-        // if node.files.is_none() {
-        //     let Ok(commit) = self.repository.find_commit(node.oid) else {
-        //         state.status = format!("failed to find commit {}", node.oid);
-        //         return;
-        //     };
-        //     let diff = match crate::common::diff(&self.repository, &commit) {
-        //         Ok(diff) => diff,
-        //         Err(error) => {
-        //             state.status = format!("{}", error);
-        //             return;
-        //         }
-        //     };
-        //     let mut files = Vec::new();
-        //     for delta in diff.deltas() {
-        //         files.push(CommitFileNode::from(delta));
-        //     }
-        //     node.files = Some(files);
-        // }
-        //
-        // node.is_collapsed = !node.is_collapsed;
-        //
+
+        // self.repo.find_blob()
+
+        Ok(())
+    }
+}
+
+// MARK: Messaging
+
+enum Message {
+    Noop,
+    Load(String),
+    Terminal(Event),
+    Exit,
+}
+
+// MARK: Controller
+
+struct Controller<'repo> {
+    model: Model<'repo>,
+    queue: VecDeque<Message>,
+}
+
+impl<'repo> Controller<'repo> {
+    fn new(model: Model<'repo>) -> Self {
+        Self {
+            model,
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn message(&mut self, message: Message) {
+        self.queue.push_back(message);
+    }
+
+    fn exit(&mut self) {
+        self.queue.clear();
+        self.message(Message::Exit);
+    }
+
+    fn select_up(&mut self) {
+        self.model.tree.select(
+            self.model
+                .tree
+                .selected()
+                .as_ref()
+                .and_then(|index| self.model.stack.find_previous_relative_of(index))
+                .map(|(index, _)| index),
+        );
+    }
+
+    fn select_down(&mut self) {
+        self.model.tree.select(
+            self.model
+                .tree
+                .selected()
+                .as_ref()
+                .and_then(|index| self.model.stack.find_next_relative_of(index))
+                .map(|(index, _)| index),
+        );
     }
 
     fn draw(&mut self, frame: &mut Frame) -> anyhow::Result<()> {
@@ -293,13 +431,11 @@ impl<'a, 'repo> Controller<'a, 'repo> {
             Some(Message::Terminal(Event::Key(key))) => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     if matches!(key.code, KeyCode::Char('c' | 'q' | 'x')) {
-                        self.queue.clear();
-                        self.message(Message::Exit);
-                        return Ok(());
+                        return Ok(self.exit());
                     }
                 }
             }
-            Some(Message::Load(base)) => self.load(base)?,
+            Some(Message::Load(base)) => self.model.load_commits_since_merge_base_with(base)?,
             _ => {}
         }
 
@@ -318,17 +454,20 @@ impl<'a, 'repo> Controller<'a, 'repo> {
         message: &Option<Message>,
     ) -> anyhow::Result<()> {
         match message.as_ref() {
-            Some(Message::Terminal(Event::Key(key))) => match key.code {
-                KeyCode::Up => self.model.select_up(),
-                KeyCode::Down => self.model.select_down(),
+            Some(Message::Terminal(Event::Key(key))) if key.is_press() => match key.code {
+                KeyCode::Up => self.select_up(),
+                KeyCode::Down => self.select_down(),
                 KeyCode::Left => {}
                 KeyCode::Right => {}
                 KeyCode::Char(' ') => {
-                    // match self.model.tree.selected().as_ref().map(TreeIndex::as_slice) {
-                    //     Some([commit_index]) => self.,
-                    //     Some([commit_index, file_index]) => {}
-                    //     _ => {}
-                    // }
+                    match self.model.tree.selected().as_ref().map(TreeIndex::as_slice) {
+                        Some([commit_index]) => self.model.toggle_deltas(*commit_index)?,
+                        Some([commit_index, file_index]) => {}
+                        _ => {}
+                    }
+                }
+                KeyCode::Char('q') => {
+                    return Ok(self.exit());
                 }
                 _ => {}
             },
@@ -396,18 +535,17 @@ pub fn with_terminal<T, F: FnOnce(DefaultTerminal) -> T>(f: F) -> T {
 
 pub fn main(repo: &Repository, options: Options) -> anyhow::Result<()> {
     with_terminal(|mut terminal| {
-        let mut model = Model::new(repo);
-        let mut context = Controller::new(&repo, &mut model);
-        context.message(Message::Load(options.base));
+        let mut controller = Controller::new(Model::new(repo));
+        controller.message(Message::Load(options.base));
 
         loop {
             let mut result = Ok(());
-            terminal.draw(|frame| result = context.draw(frame))?;
+            terminal.draw(|frame| result = controller.draw(frame))?;
             result?;
 
-            match context.queue.front() {
+            match controller.queue.front() {
                 Some(Message::Exit) => break,
-                None => context.message(Message::Terminal(crossterm::event::read()?)),
+                None => controller.message(Message::Terminal(crossterm::event::read()?)),
                 _ => {}
             }
         }

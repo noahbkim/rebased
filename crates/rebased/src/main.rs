@@ -4,8 +4,7 @@ use clap::Parser;
 use clap::Subcommand;
 use git2::Repository;
 
-mod common;
-mod engine;
+mod events;
 mod stack;
 
 #[derive(Parser, Debug)]
