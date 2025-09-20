@@ -1,19 +1,19 @@
-use git2::{Commit, Delta, Deltas, Diff, DiffDelta, DiffFlags, FileMode, Oid};
-use git2::{DiffFile, Repository};
-use std::collections::VecDeque;
-use std::ops::{Deref, Index, SubAssign};
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-
 use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
+use git2::{Commit, Delta, Deltas, Diff, DiffDelta, DiffFlags, FileMode, Oid};
+use git2::{DiffFile, Repository};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::prelude::{StatefulWidget, Style, Stylize, Widget};
-use ratatui::text::{Line, ToSpan};
-use ratatui::widgets::{Block, BorderType, Paragraph, StatefulWidgetRef};
+use ratatui::text::{Line, Text, ToLine, ToSpan};
+use ratatui::widgets::{Block, BorderType, Paragraph, StatefulWidgetRef, WidgetRef};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_tree::{tree_index, Tree, TreeIndex, TreeItem, TreeState, TreeView};
+use std::collections::VecDeque;
+use std::ops::{AddAssign, Deref, Index, SubAssign};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::RwLock;
 
 // MARK: Extra
 
@@ -70,6 +70,32 @@ struct CommitNode<'repo> {
     diff: Option<Diff<'repo>>,
     deltas: Vec<Node<'repo>>,
     is_collapsed: bool,
+}
+
+impl<'repo> CommitNode<'repo> {
+    pub fn get(&self, index: usize) -> Option<&DeltaNode> {
+        self.deltas.get(index).map(Node::unwrap_delta_ref)
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut DeltaNode> {
+        self.deltas.get_mut(index).map(Node::unwrap_delta_mut)
+    }
+
+    pub fn push<T: Into<DeltaNode>>(&mut self, delta: T) {
+        self.deltas.push(Node::Delta(delta.into()));
+    }
+
+    pub fn clear(&mut self) {
+        self.deltas.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.deltas.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.deltas.is_empty()
+    }
 }
 
 impl<'repo> From<Commit<'repo>> for CommitNode<'repo> {
@@ -245,6 +271,7 @@ struct Model<'repo> {
     repo: &'repo Repository,
     stack: StackTree<'repo>,
     tree: TreeState,
+    preview: Paragraph<'static>,
 }
 
 impl<'repo> Model<'repo> {
@@ -253,6 +280,7 @@ impl<'repo> Model<'repo> {
             repo,
             stack: StackTree::new(),
             tree: TreeState::new(),
+            preview: Paragraph::new(""),
         }
     }
 
@@ -357,14 +385,48 @@ impl<'repo> Model<'repo> {
             return Ok(());
         };
 
-        // let Some(stack_commit_delta) = stack_commit.get_mut(delta_index) else {
-        //     // state.status = format!("invalid commit index {}", index);
-        //     // TODO
-        //     return Ok(());
-        // };
+        let counter = RwLock::new(0usize);
+        let lines = RwLock::new(Vec::new());
+        if let Some(diff) = stack_commit.diff.as_ref() {
+            diff.foreach(
+                &mut |_delta, _x| {
+                    counter.write().unwrap().add_assign(1);
+                    true
+                },
+                Some(&mut |_delta, _binary| true),
+                Some(&mut |delta, hunk| {
+                    if *counter.read().unwrap() != delta_index + 1 {
+                        return true;
+                    }
 
-        // self.repo.find_blob()
+                    let mut text = String::from_utf8_lossy(hunk.header()).to_string();
+                    text.push_str("\n");
+                    lines.write().unwrap().push(Line::from(text));
+                    true
+                }),
+                Some(&mut |_delta, _hunk, line| {
+                    if *counter.read().unwrap() != delta_index + 1 {
+                        return true;
+                    }
 
+                    let mut style = Style::new();
+                    let mut text = String::from_utf8_lossy(line.content()).to_string();
+                    if line.old_lineno().is_some() && line.new_lineno().is_some() {
+                        text.insert_str(0, "  ");
+                    } else if line.new_lineno().is_some() {
+                        text.insert_str(0, "+ ");
+                        style = style.green();
+                    } else if line.old_lineno().is_some() {
+                        text.insert_str(0, "- ");
+                        style = style.red();
+                    }
+                    lines.write().unwrap().push(Line::from(text).style(style));
+                    true
+                }),
+            )?;
+        }
+
+        self.preview = Paragraph::new(lines.into_inner()?);
         Ok(())
     }
 }
@@ -462,7 +524,9 @@ impl<'repo> Controller<'repo> {
                 KeyCode::Char(' ') => {
                     match self.model.tree.selected().as_ref().map(TreeIndex::as_slice) {
                         Some([commit_index]) => self.model.toggle_deltas(*commit_index)?,
-                        Some([commit_index, file_index]) => {}
+                        Some([commit_index, file_index]) => {
+                            self.model.show_delta(*commit_index, *file_index)?
+                        }
                         _ => {}
                     }
                 }
@@ -484,9 +548,15 @@ impl<'repo> Controller<'repo> {
                     .border_type(BorderType::Rounded),
             );
 
-        let layout = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(2)]);
-        let [tree_area, preview_area] = layout.areas(area);
+        let layout = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(2),
+        ]);
+        let [tree_area, _, preview_area] = layout.areas(area);
         StatefulWidget::render(tree, tree_area, buffer, &mut self.model.tree);
+
+        self.model.preview.render_ref(preview_area, buffer);
 
         Ok(())
     }
