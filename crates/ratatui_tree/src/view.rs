@@ -82,7 +82,7 @@ pub trait TreeView<T: TreeView<T>> {
         }
 
         let clamped = origin.first().min(self.len_children() - 1);
-        let mut index = TreeIndex::new_at(clamped);
+        let mut index = TreeIndex::new(clamped);
         let mut cursor = self.get_child(clamped).unwrap();
         for &i in origin.iter_rest() {
             if cursor.is_empty() {
@@ -102,7 +102,7 @@ pub trait TreeView<T: TreeView<T>> {
     }
 
     fn find_first_descendant(&self) -> Option<(TreeIndex, &T)> {
-        self.get_child(0).map(|child| (TreeIndex::new_at(0), child))
+        self.get_child(0).map(|child| (TreeIndex::new(0), child))
     }
 
     fn find_last_descendant_in(&self, mut index: TreeIndex) -> Option<(TreeIndex, &T)> {
@@ -122,7 +122,7 @@ pub trait TreeView<T: TreeView<T>> {
     }
 
     fn find_last_descendant(&self) -> Option<(TreeIndex, &T)> {
-        self.find_last_descendant_in(TreeIndex::new_at(self.len_children().saturating_sub(1)))
+        self.find_last_descendant_in(TreeIndex::new(self.len_children().saturating_sub(1)))
     }
 
     fn find_previous_child_to(&self, index: usize) -> Option<(usize, &T)> {
@@ -138,7 +138,7 @@ pub trait TreeView<T: TreeView<T>> {
     fn find_previous_sibling_of(&self, index: &TreeIndex) -> Option<(TreeIndex, &T)> {
         if index.is_root() {
             self.find_previous_child_to(index.first())
-                .map(|(i, child)| (TreeIndex::new_at(i), child))
+                .map(|(i, child)| (TreeIndex::new(i), child))
         } else {
             let parent_index = index.popped();
             self.get_descendant(&parent_index).and_then(|parent| {
@@ -150,7 +150,7 @@ pub trait TreeView<T: TreeView<T>> {
     }
 
     fn find_previous_relative_of(&self, index: &TreeIndex) -> Option<(TreeIndex, &T)> {
-        let mut cursor_index = TreeIndex::new_at(index.first());
+        let mut cursor_index = TreeIndex::new(index.first());
         let mut cursor = self.get_child(index.first())?;
         let mut previous = self
             .find_previous_child_to(index.first())
@@ -181,7 +181,7 @@ pub trait TreeView<T: TreeView<T>> {
     fn find_next_sibling_of(&self, index: &TreeIndex) -> Option<(TreeIndex, &T)> {
         if index.is_root() {
             self.find_next_child_to(index.first())
-                .map(|(i, child)| (TreeIndex::new_at(i), child))
+                .map(|(i, child)| (TreeIndex::new(i), child))
         } else {
             let parent_index = index.popped();
             self.get_descendant(&parent_index).and_then(|parent| {

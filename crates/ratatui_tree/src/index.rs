@@ -8,11 +8,11 @@ impl Default for TreeIndex {
 }
 
 impl TreeIndex {
-    pub fn new() -> Self {
+    pub fn zero() -> Self {
         Self::default()
     }
 
-    pub fn new_at(index: usize) -> Self {
+    pub fn new(index: usize) -> Self {
         Self(vec![index])
     }
 

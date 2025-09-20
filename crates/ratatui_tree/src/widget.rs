@@ -25,15 +25,24 @@ pub struct TreeItem<'a> {
 }
 
 impl<'a> TreeItem<'a> {
-    pub fn new<T>(content: T) -> Self
+    pub fn new<T, U>(content: T, children: U) -> Self
     where
         T: Into<Text<'a>>,
+        U: IntoIterator,
+        U::Item: Into<TreeItem<'a>>,
     {
         Self {
             content: content.into(),
+            children: children.into_iter().map(Into::into).collect(),
             style: Style::default(),
-            children: Vec::default(),
         }
+    }
+
+    pub fn new_empty<T>(content: T) -> Self
+    where
+        T: Into<Text<'a>>,
+    {
+        Self::new(content, Vec::<TreeItem>::new())
     }
 
     #[must_use = "method moves the value of self and returns the modified value"]
@@ -180,18 +189,6 @@ impl<'a> Tree<'a> {
     }
 }
 
-impl<'a> Styled for Tree<'a> {
-    type Item = Self;
-
-    fn style(&self) -> Style {
-        self.style
-    }
-
-    fn set_style<S: Into<Style>>(self, style: S) -> Self::Item {
-        self.style(style)
-    }
-}
-
 impl<'a> TreeView<TreeItem<'a>> for Tree<'a> {
     type ChildIter<'c>
         = std::slice::Iter<'c, TreeItem<'a>>
@@ -238,7 +235,7 @@ impl TreeState {
 impl<'a> Tree<'a> {
     pub fn select_up(&self, selected: &mut Option<TreeIndex>) {
         *selected = match selected {
-            None => self.find_first_child().map(|r| TreeIndex::new_at(r.0)),
+            None => self.find_first_child().map(|r| TreeIndex::new(r.0)),
             Some(index) => match self.find_previous_relative_of(index) {
                 Some((next, _)) => Some(next),
                 None => return,
@@ -266,7 +263,7 @@ impl<'a> Tree<'a> {
 
     pub fn select_parent(&self, selected: &mut Option<TreeIndex>) {
         *selected = match selected {
-            None => self.find_first_child().map(|r| TreeIndex::new_at(r.0)),
+            None => self.find_first_child().map(|r| TreeIndex::new(r.0)),
             Some(index) => match self.find_parent_of(index.clone()) {
                 Some((next, _)) => Some(next),
                 None => return,

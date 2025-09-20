@@ -5,6 +5,7 @@ use clap::Subcommand;
 use git2::Repository;
 
 mod common;
+mod engine;
 mod stack;
 
 #[derive(Parser, Debug)]
@@ -36,6 +37,6 @@ fn main() -> anyhow::Result<()> {
     };
 
     match args.command {
-        Command::Stack { base } => stack::main(repository, base),
+        Command::Stack { base } => stack::main(&repository, stack::Options { base }),
     }
 }

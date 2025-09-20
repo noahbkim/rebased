@@ -63,7 +63,7 @@ impl<'a, T: TreeView<T>> TreeIterWithIndex<'a, T> {
             root.iter_children()
                 .enumerate()
                 .rev()
-                .map(|(i, child)| (TreeIndex::new_at(i), child))
+                .map(|(i, child)| (TreeIndex::new(i), child))
                 .collect(),
         )
     }
